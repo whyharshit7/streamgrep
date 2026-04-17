@@ -70,6 +70,9 @@ PYTHONPATH=src python3 -m streamgrep "payment failure" src tests \
 - `--max-chars`: cap chunk size before embedding.
 - `--json`: emit newline-delimited JSON instead of human-readable text.
 - `--hidden`: include hidden files and directories.
+- `-j/--workers`: search multiple files concurrently. Per-file streaming order
+  is preserved, and global output follows the file-iteration order regardless
+  of which worker finishes first.
 
 ## Design notes
 
@@ -80,7 +83,6 @@ PYTHONPATH=src python3 -m streamgrep "payment failure" src tests \
 
 ## Next improvements
 
-- Add a thread pool so multiple files can be embedded concurrently while preserving streaming order per file.
 - Add model-specific batching for semantic windows to improve throughput.
 - Add incremental reranking so the best-so-far results can be surfaced while the scan is still in progress.
 - Add `--follow` and filesystem watch support for long-running live search sessions.

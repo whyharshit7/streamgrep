@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Queue
 import re
 from typing import Iterable, Iterator
 
@@ -13,6 +15,8 @@ from streamgrep.types import SearchResult
 
 WHITESPACE_RE = re.compile(r"\s+")
 _SEMANTIC_DEDUP_WINDOW = 4
+_PER_FILE_QUEUE_DEPTH = 32
+_WORKER_DONE = object()
 
 
 @dataclass(frozen=True)
@@ -24,6 +28,11 @@ class SearchOptions:
     semantic_threshold: float = 0.44
     max_results_per_file: int | None = None
     include_hidden: bool = False
+    max_workers: int = 1
+
+    def __post_init__(self) -> None:
+        if self.max_workers < 1:
+            raise ValueError("max_workers must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -46,8 +55,72 @@ class StreamingHybridSearcher:
         options: SearchOptions,
     ) -> Iterator[SearchResult]:
         prepared = self.prepare_query(query, include_semantic=options.mode != "fulltext")
-        for path in iter_searchable_files(paths, include_hidden=options.include_hidden):
-            yield from self.search_file(path, prepared, options=options)
+        files = iter_searchable_files(paths, include_hidden=options.include_hidden)
+
+        if options.max_workers == 1:
+            for path in files:
+                yield from self.search_file(path, prepared, options=options)
+            return
+
+        yield from self._search_paths_concurrent(files, prepared, options=options)
+
+    def _search_paths_concurrent(
+        self,
+        files: Iterable[Path],
+        prepared: PreparedQuery,
+        *,
+        options: SearchOptions,
+    ) -> Iterator[SearchResult]:
+        """Run per-file search on a thread pool, preserving per-file order.
+
+        Each in-flight file owns a bounded queue. The consumer drains the oldest
+        file's queue to completion before moving to the next, so global output
+        order matches the file-iteration order while embeddings run in parallel.
+        """
+        pending: deque[Queue] = deque()
+        file_iter = iter(files)
+
+        def submit(executor: ThreadPoolExecutor, path: Path) -> None:
+            queue: Queue = Queue(maxsize=_PER_FILE_QUEUE_DEPTH)
+            pending.append(queue)
+            executor.submit(self._run_worker, path, prepared, options, queue)
+
+        with ThreadPoolExecutor(max_workers=options.max_workers) as executor:
+            for _ in range(options.max_workers):
+                try:
+                    submit(executor, next(file_iter))
+                except StopIteration:
+                    break
+
+            while pending:
+                queue = pending.popleft()
+                while True:
+                    item = queue.get()
+                    if item is _WORKER_DONE:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item
+                    yield item
+
+                try:
+                    submit(executor, next(file_iter))
+                except StopIteration:
+                    continue
+
+    def _run_worker(
+        self,
+        path: Path,
+        prepared: PreparedQuery,
+        options: SearchOptions,
+        queue: Queue,
+    ) -> None:
+        try:
+            for result in self.search_file(path, prepared, options=options):
+                queue.put(result)
+        except BaseException as exc:
+            queue.put(exc)
+        finally:
+            queue.put(_WORKER_DONE)
 
     def prepare_query(self, query: str, *, include_semantic: bool) -> PreparedQuery:
         lowered = query.strip().lower()

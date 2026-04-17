@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import math
 import re
+import threading
 from typing import Protocol
 
 TOKEN_RE = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*")
@@ -142,6 +143,7 @@ class SentenceTransformerEmbeddingProvider:
             )
         self.model_name = model_name
         self._model: object | None = None
+        self._load_lock = threading.Lock()
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         model = self._load_model()
@@ -150,9 +152,11 @@ class SentenceTransformerEmbeddingProvider:
 
     def _load_model(self) -> object:
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            with self._load_lock:
+                if self._model is None:
+                    from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(self.model_name)
+                    self._model = SentenceTransformer(self.model_name)
         return self._model
 
 

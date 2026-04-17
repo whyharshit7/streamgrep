@@ -67,6 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional cap on emitted matches per file.",
     )
     parser.add_argument(
+        "-j",
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of files to search concurrently (preserves per-file order).",
+    )
+    parser.add_argument(
         "--hidden",
         action="store_true",
         help="Include hidden files and directories.",
@@ -112,6 +119,9 @@ def main(argv: list[str] | None = None, *, stdout: IO[str] | None = None, stderr
     except ValueError as exc:
         parser.error(str(exc))
 
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
+
     searcher = StreamingHybridSearcher(provider)
     options = SearchOptions(
         mode=args.mode,
@@ -121,6 +131,7 @@ def main(argv: list[str] | None = None, *, stdout: IO[str] | None = None, stderr
         semantic_threshold=args.semantic_threshold,
         max_results_per_file=args.max_results_per_file,
         include_hidden=args.hidden,
+        max_workers=args.workers,
     )
 
     results = searcher.search_paths(args.query, valid_paths, options=options)

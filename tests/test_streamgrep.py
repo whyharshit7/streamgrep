@@ -260,6 +260,97 @@ class StreamGrepTests(unittest.TestCase):
             with self.assertRaises(ModuleNotFoundError):
                 create_embedding_provider("sentence-transformers")
 
+    def test_concurrent_search_matches_sequential_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for idx in range(6):
+                lines = [
+                    f"file {idx} line 0: nothing to see",
+                    f"file {idx} line 1: the login system reports an authentication error",
+                    f"file {idx} line 2: unrelated content",
+                    f"file {idx} line 3: another login failure mentioned here",
+                ]
+                (root / f"f{idx}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            searcher = StreamingHybridSearcher(HashingEmbeddingProvider())
+            sequential = list(
+                searcher.search_paths(
+                    "login error",
+                    [str(root)],
+                    options=SearchOptions(mode="hybrid", window_lines=2, stride_lines=1),
+                )
+            )
+            concurrent = list(
+                searcher.search_paths(
+                    "login error",
+                    [str(root)],
+                    options=SearchOptions(
+                        mode="hybrid",
+                        window_lines=2,
+                        stride_lines=1,
+                        max_workers=4,
+                    ),
+                )
+            )
+
+            self.assertEqual(
+                [(str(r.path), r.start_line, r.end_line, r.kind) for r in sequential],
+                [(str(r.path), r.start_line, r.end_line, r.kind) for r in concurrent],
+            )
+
+    def test_concurrent_preserves_per_file_line_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for idx in range(4):
+                (root / f"f{idx}.txt").write_text(
+                    "\n".join(f"login hit line {line}" for line in range(10)) + "\n",
+                    encoding="utf-8",
+                )
+
+            searcher = StreamingHybridSearcher(HashingEmbeddingProvider())
+            results = list(
+                searcher.search_paths(
+                    "login",
+                    [str(root)],
+                    options=SearchOptions(mode="fulltext", max_workers=4),
+                )
+            )
+
+            per_file_lines: dict[str, list[int]] = {}
+            for result in results:
+                per_file_lines.setdefault(str(result.path), []).append(result.start_line)
+
+            for path, line_numbers in per_file_lines.items():
+                self.assertEqual(line_numbers, sorted(line_numbers), f"{path} out of order")
+
+    def test_concurrent_worker_exception_propagates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "a.txt").write_text("login\n", encoding="utf-8")
+            (root / "b.txt").write_text("login\n", encoding="utf-8")
+
+            searcher = StreamingHybridSearcher(HashingEmbeddingProvider())
+            original = searcher.search_file
+
+            def flaky(path: Path, prepared, *, options):
+                if path.name == "b.txt":
+                    raise RuntimeError("boom")
+                return original(path, prepared, options=options)
+
+            with patch.object(searcher, "search_file", side_effect=flaky):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    list(
+                        searcher.search_paths(
+                            "login",
+                            [str(root)],
+                            options=SearchOptions(mode="fulltext", max_workers=2),
+                        )
+                    )
+
+    def test_search_options_rejects_zero_workers(self) -> None:
+        with self.assertRaises(ValueError):
+            SearchOptions(max_workers=0)
+
 
 if __name__ == "__main__":
     unittest.main()
